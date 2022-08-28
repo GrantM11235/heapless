@@ -1,6 +1,6 @@
 use core::{
-    cmp::Ordering, convert::TryFrom, fmt, hash, iter::FromIterator, mem::MaybeUninit, ops, ptr,
-    slice,
+    borrow::BorrowMut, cmp::Ordering, convert::TryFrom, fmt, hash, iter::FromIterator,
+    marker::PhantomData, mem::MaybeUninit, ops, ptr, slice,
 };
 use hash32;
 
@@ -33,9 +33,10 @@ use hash32;
 /// }
 /// assert_eq!(*vec, [7, 1, 2, 3]);
 /// ```
-pub struct Vec<T, const N: usize> {
-    buffer: [MaybeUninit<T>; N],
+pub struct Vec<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]> = [MaybeUninit<T>; N]> {
+    buffer: S,
     len: usize,
+    _phantom: PhantomData<[T; N]>,
 }
 
 impl<T, const N: usize> Vec<T, N> {
@@ -62,6 +63,7 @@ impl<T, const N: usize> Vec<T, N> {
         Self {
             buffer: [Self::INIT; N],
             len: 0,
+            _phantom: PhantomData,
         }
     }
 
@@ -95,7 +97,36 @@ impl<T, const N: usize> Vec<T, N> {
         new.extend_from_slice(self.as_slice()).unwrap();
         new
     }
+}
 
+impl<'a, T, const N: usize> Vec<T, N, &'a mut [MaybeUninit<T>; N]> {
+    /// Creates a new vec with existing buffer
+    ///
+    /// Examples
+    ///
+    /// ```
+    /// use core::mem::MaybeUninit;
+    ///
+    /// use heapless::Vec;
+    ///
+    /// let mut buffer: [MaybeUninit<u8>; 4] = [MaybeUninit::uninit(); 4];
+    /// let mut vec = Vec::new_with_external_buffer(&mut buffer);
+    /// vec.extend_from_slice(&[1,2,3,4]);
+    /// // Don't do this:
+    /// // unsafe { MaybeUninit::array_assume_init(buffer) }
+    /// // When the vec is implicitly dropped, it drops anything that has been put in the buffer.
+    /// // Use vec.into_array().unwrap() instead.
+    /// ```
+    pub fn new_with_external_buffer(buffer: &'a mut [MaybeUninit<T>; N]) -> Self {
+        Self {
+            buffer,
+            len: 0,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Vec<T, N, S> {
     /// Extracts a slice containing the entire vector.
     ///
     /// Equivalent to `&s[..]`.
@@ -110,7 +141,7 @@ impl<T, const N: usize> Vec<T, N> {
     pub fn as_slice(&self) -> &[T] {
         // NOTE(unsafe) avoid bound checks in the slicing operation
         // &buffer[..self.len]
-        unsafe { slice::from_raw_parts(self.buffer.as_ptr() as *const T, self.len) }
+        unsafe { slice::from_raw_parts(self.buffer.borrow().as_ptr() as *const T, self.len) }
     }
 
     /// Returns the contents of the vector as an array of length `M` if the length
@@ -126,8 +157,9 @@ impl<T, const N: usize> Vec<T, N> {
     /// ```
     pub fn into_array<const M: usize>(self) -> Result<[T; M], Self> {
         if self.len() == M {
+            let array_ref: &[MaybeUninit<T>; N] = self.buffer.borrow();
             // This is how the unstable `MaybeUninit::array_assume_init` method does it
-            let array = unsafe { (&self.buffer as *const _ as *const [T; M]).read() };
+            let array = unsafe { (array_ref as *const _ as *const [T; M]).read() };
 
             // We don't want `self`'s destructor to be called because that would drop all the
             // items in the array
@@ -154,7 +186,9 @@ impl<T, const N: usize> Vec<T, N> {
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         // NOTE(unsafe) avoid bound checks in the slicing operation
         // &mut buffer[..self.len]
-        unsafe { slice::from_raw_parts_mut(self.buffer.as_mut_ptr() as *mut T, self.len) }
+        unsafe {
+            slice::from_raw_parts_mut(self.buffer.borrow_mut().as_mut_ptr() as *mut T, self.len)
+        }
     }
 
     /// Returns the maximum number of elements the vector can hold.
@@ -243,7 +277,12 @@ impl<T, const N: usize> Vec<T, N> {
         debug_assert!(!self.is_empty());
 
         self.len -= 1;
-        (self.buffer.get_unchecked_mut(self.len).as_ptr() as *const T).read()
+        (self
+            .buffer
+            .borrow_mut()
+            .get_unchecked_mut(self.len)
+            .as_ptr() as *const T)
+            .read()
     }
 
     /// Appends an `item` to the back of the collection
@@ -256,7 +295,7 @@ impl<T, const N: usize> Vec<T, N> {
         // use `ptr::write` to avoid running `T`'s destructor on the uninitialized memory
         debug_assert!(!self.is_full());
 
-        *self.buffer.get_unchecked_mut(self.len) = MaybeUninit::new(item);
+        *self.buffer.borrow_mut().get_unchecked_mut(self.len) = MaybeUninit::new(item);
 
         self.len += 1;
     }
@@ -545,7 +584,7 @@ impl<T, const N: usize> Default for Vec<T, N> {
     }
 }
 
-impl<T, const N: usize> fmt::Debug for Vec<T, N>
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> fmt::Debug for Vec<T, N, S>
 where
     T: fmt::Debug,
 {
@@ -554,7 +593,7 @@ where
     }
 }
 
-impl<const N: usize> fmt::Write for Vec<u8, N> {
+impl<const N: usize, S: BorrowMut<[MaybeUninit<u8>; N]>> fmt::Write for Vec<u8, N, S> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         match self.extend_from_slice(s.as_bytes()) {
             Ok(()) => Ok(()),
@@ -563,7 +602,7 @@ impl<const N: usize> fmt::Write for Vec<u8, N> {
     }
 }
 
-impl<T, const N: usize> Drop for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Drop for Vec<T, N, S> {
     fn drop(&mut self) {
         // We drop each element used in the vector by turning into a &mut[T]
         unsafe {
@@ -580,7 +619,7 @@ impl<'a, T: Clone, const N: usize> TryFrom<&'a [T]> for Vec<T, N> {
     }
 }
 
-impl<T, const N: usize> Extend<T> for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Extend<T> for Vec<T, N, S> {
     fn extend<I>(&mut self, iter: I)
     where
         I: IntoIterator<Item = T>,
@@ -589,7 +628,7 @@ impl<T, const N: usize> Extend<T> for Vec<T, N> {
     }
 }
 
-impl<'a, T, const N: usize> Extend<&'a T> for Vec<T, N>
+impl<'a, T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Extend<&'a T> for Vec<T, N, S>
 where
     T: 'a + Copy,
 {
@@ -601,7 +640,7 @@ where
     }
 }
 
-impl<T, const N: usize> hash::Hash for Vec<T, N>
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> hash::Hash for Vec<T, N, S>
 where
     T: core::hash::Hash,
 {
@@ -610,7 +649,7 @@ where
     }
 }
 
-impl<T, const N: usize> hash32::Hash for Vec<T, N>
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> hash32::Hash for Vec<T, N, S>
 where
     T: hash32::Hash,
 {
@@ -619,7 +658,7 @@ where
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a Vec<T, N> {
+impl<'a, T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> IntoIterator for &'a Vec<T, N, S> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
 
@@ -628,7 +667,9 @@ impl<'a, T, const N: usize> IntoIterator for &'a Vec<T, N> {
     }
 }
 
-impl<'a, T, const N: usize> IntoIterator for &'a mut Vec<T, N> {
+impl<'a, T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> IntoIterator
+    for &'a mut Vec<T, N, S>
+{
     type Item = &'a mut T;
     type IntoIter = slice::IterMut<'a, T>;
 
@@ -656,17 +697,23 @@ impl<T, const N: usize> FromIterator<T> for Vec<T, N> {
 ///
 /// [`Vec`]: (https://doc.rust-lang.org/std/vec/struct.Vec.html)
 ///
-pub struct IntoIter<T, const N: usize> {
-    vec: Vec<T, N>,
+pub struct IntoIter<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]> = [MaybeUninit<T>; N]> {
+    vec: Vec<T, N, S>,
     next: usize,
 }
 
-impl<T, const N: usize> Iterator for IntoIter<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Iterator for IntoIter<T, N, S> {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
         if self.next < self.vec.len() {
             let item = unsafe {
-                (self.vec.buffer.get_unchecked_mut(self.next).as_ptr() as *const T).read()
+                (self
+                    .vec
+                    .buffer
+                    .borrow_mut()
+                    .get_unchecked_mut(self.next)
+                    .as_ptr() as *const T)
+                    .read()
             };
             self.next += 1;
             Some(item)
@@ -697,7 +744,7 @@ where
     }
 }
 
-impl<T, const N: usize> Drop for IntoIter<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Drop for IntoIter<T, N, S> {
     fn drop(&mut self) {
         unsafe {
             // Drop all the elements that have not been moved out of vec
@@ -708,26 +755,33 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
     }
 }
 
-impl<T, const N: usize> IntoIterator for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> IntoIterator for Vec<T, N, S> {
     type Item = T;
-    type IntoIter = IntoIter<T, N>;
+    type IntoIter = IntoIter<T, N, S>;
 
     fn into_iter(self) -> Self::IntoIter {
         IntoIter { vec: self, next: 0 }
     }
 }
 
-impl<A, B, const N1: usize, const N2: usize> PartialEq<Vec<B, N2>> for Vec<A, N1>
+impl<
+        A,
+        B,
+        const N1: usize,
+        const N2: usize,
+        S1: BorrowMut<[MaybeUninit<A>; N1]>,
+        S2: BorrowMut<[MaybeUninit<B>; N2]>,
+    > PartialEq<Vec<B, N2, S2>> for Vec<A, N1, S1>
 where
     A: PartialEq<B>,
 {
-    fn eq(&self, other: &Vec<B, N2>) -> bool {
+    fn eq(&self, other: &Vec<B, N2, S2>) -> bool {
         <[A]>::eq(self, &**other)
     }
 }
 
 // Vec<A, N> == [B]
-impl<A, B, const N: usize> PartialEq<[B]> for Vec<A, N>
+impl<A, B, const N: usize, S: BorrowMut<[MaybeUninit<A>; N]>> PartialEq<[B]> for Vec<A, N, S>
 where
     A: PartialEq<B>,
 {
@@ -737,7 +791,7 @@ where
 }
 
 // Vec<A, N> == &[B]
-impl<A, B, const N: usize> PartialEq<&[B]> for Vec<A, N>
+impl<A, B, const N: usize, S: BorrowMut<[MaybeUninit<A>; N]>> PartialEq<&[B]> for Vec<A, N, S>
 where
     A: PartialEq<B>,
 {
@@ -747,7 +801,7 @@ where
 }
 
 // Vec<A, N> == &mut [B]
-impl<A, B, const N: usize> PartialEq<&mut [B]> for Vec<A, N>
+impl<A, B, const N: usize, S: BorrowMut<[MaybeUninit<A>; N]>> PartialEq<&mut [B]> for Vec<A, N, S>
 where
     A: PartialEq<B>,
 {
@@ -758,7 +812,8 @@ where
 
 // Vec<A, N> == [B; M]
 // Equality does not require equal capacity
-impl<A, B, const N: usize, const M: usize> PartialEq<[B; M]> for Vec<A, N>
+impl<A, B, const N: usize, const M: usize, S: BorrowMut<[MaybeUninit<A>; N]>> PartialEq<[B; M]>
+    for Vec<A, N, S>
 where
     A: PartialEq<B>,
 {
@@ -769,7 +824,8 @@ where
 
 // Vec<A, N> == &[B; M]
 // Equality does not require equal capacity
-impl<A, B, const N: usize, const M: usize> PartialEq<&[B; M]> for Vec<A, N>
+impl<A, B, const N: usize, const M: usize, S: BorrowMut<[MaybeUninit<A>; N]>> PartialEq<&[B; M]>
+    for Vec<A, N, S>
 where
     A: PartialEq<B>,
 {
@@ -779,18 +835,24 @@ where
 }
 
 // Implements Eq if underlying data is Eq
-impl<T, const N: usize> Eq for Vec<T, N> where T: Eq {}
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Eq for Vec<T, N, S> where T: Eq {}
 
-impl<T, const N1: usize, const N2: usize> PartialOrd<Vec<T, N2>> for Vec<T, N1>
+impl<
+        T,
+        const N1: usize,
+        const N2: usize,
+        S1: BorrowMut<[MaybeUninit<T>; N1]>,
+        S2: BorrowMut<[MaybeUninit<T>; N2]>,
+    > PartialOrd<Vec<T, N2, S2>> for Vec<T, N1, S1>
 where
     T: PartialOrd,
 {
-    fn partial_cmp(&self, other: &Vec<T, N2>) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Vec<T, N2, S2>) -> Option<Ordering> {
         PartialOrd::partial_cmp(&**self, &**other)
     }
 }
 
-impl<T, const N: usize> Ord for Vec<T, N>
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> Ord for Vec<T, N, S>
 where
     T: Ord,
 {
@@ -800,7 +862,7 @@ where
     }
 }
 
-impl<T, const N: usize> ops::Deref for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> ops::Deref for Vec<T, N, S> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
@@ -808,34 +870,34 @@ impl<T, const N: usize> ops::Deref for Vec<T, N> {
     }
 }
 
-impl<T, const N: usize> ops::DerefMut for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> ops::DerefMut for Vec<T, N, S> {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T, const N: usize> AsRef<Vec<T, N>> for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> AsRef<Vec<T, N, S>> for Vec<T, N, S> {
     #[inline]
     fn as_ref(&self) -> &Self {
         self
     }
 }
 
-impl<T, const N: usize> AsMut<Vec<T, N>> for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> AsMut<Vec<T, N, S>> for Vec<T, N, S> {
     #[inline]
     fn as_mut(&mut self) -> &mut Self {
         self
     }
 }
 
-impl<T, const N: usize> AsRef<[T]> for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> AsRef<[T]> for Vec<T, N, S> {
     #[inline]
     fn as_ref(&self) -> &[T] {
         self
     }
 }
 
-impl<T, const N: usize> AsMut<[T]> for Vec<T, N> {
+impl<T, const N: usize, S: BorrowMut<[MaybeUninit<T>; N]>> AsMut<[T]> for Vec<T, N, S> {
     #[inline]
     fn as_mut(&mut self) -> &mut [T] {
         self
